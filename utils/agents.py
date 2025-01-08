@@ -559,10 +559,11 @@ class BedrockAgents:
             logger.info(f"Associated agent '{agent_id}' with KB '{kb_id}'")
             logger.info(f"Response: {associate_kb_with_agent_response}")
 
-        # Prepare the agent to ensure it's ready for invocation
-        prepare_agent_response = self.bedrock_agent_client.prepare_agent(agentId=agent_id)
-        if verbose:
-            logger.info(f"Agent '{agent_id}' is prepared for invocation: {prepare_agent_response}")
+
+        # # Prepare the agent to ensure it's ready for invocation
+        # prepare_agent_response = self.bedrock_agent_client.prepare_agent(agentId=agent_id)
+        # if verbose:
+        #     logger.info(f"Agent '{agent_id}' is prepared for invocation: {prepare_agent_response}")
 
     # -------------------------------------------------------------------------
     # 3.5: Delete a Bedrock Agent
@@ -1041,6 +1042,7 @@ class BedrockAgents:
             agent_name (str): Name of the existing agent.
             verbose (bool, optional): If True, logs additional info.
         """
+        # self.context.interactive_sleep(15)
         agent_id = self.get_agent_id_by_name(agent_name, verbose=verbose)
         if agent_id is None:
             if verbose:
@@ -1049,8 +1051,8 @@ class BedrockAgents:
 
         try:
             # Wait for agent to be in valid state before modification
-            if not self.wait_for_agent_state(agent_id, "AVAILABLE"):
-                raise RuntimeError("Agent failed to reach AVAILABLE state")
+            if not self.wait_for_agent_state(agent_name, "NOT_PREPARED"):
+                raise RuntimeError("Agent failed to reach NOT_PREPARED state")
 
             create_action_group_response = self.bedrock_agent_client.create_agent_action_group(
                 agentId=agent_id,
@@ -1065,7 +1067,7 @@ class BedrockAgents:
                     logger.info(f"Added code interpreter to agent '{agent_name}'")
                 
                 # Wait for agent to be ready before preparing
-                if self.wait_for_agent_state(agent_id, "AVAILABLE"):
+                if self.wait_for_agent_state(agent_name, "NOT_PREPARED"): #  <-- NOT_PREPARED is the desired state not AVAILABLE
                     self.prepare_bedrock_agent(agent_name, verbose)
                 else:
                     logger.error("Timeout waiting for agent to be available")
@@ -1329,7 +1331,72 @@ class BedrockAgents:
             return {"error": error_message}
 
 
+    
+    def simple_invoke(self, agent_name: str, input_text: str, verbose: bool = False) -> dict:
+        """
+        Invokes a Bedrock Agent with a string of input text, returning the response and trace.
 
+        Args:
+            agent_name (str): Name of the agent to invoke.
+            input_text (str): Text to provide as input.
+            verbose (bool, optional): If True, logs additional info.
+
+        Returns:
+            dict: A dictionary containing the agent's response and trace information.
+        """
+        try:
+            # Find the agent by name
+            agent_id = self.get_agent_id_by_name(agent_name)
+            if agent_id is None:
+                if verbose:
+                    logger.error(f"Agent '{agent_name}' not found.")
+                return {"error": "Agent not found"}
+
+            if verbose:
+                logger.info(f"Invoking agent '{agent_name}' with input: {input_text}")
+
+            # Generate a fresh session ID
+            session_id = str(uuid.uuid4())
+
+            # Call the agent with tracing enabled
+            response = self.bedrock_agent_runtime_client.invoke_agent(
+                inputText=input_text,
+                agentId=agent_id,
+                agentAliasId=DEFAULT_ALIAS,
+                sessionId=session_id,
+                sessionState={},
+                enableTrace=True  # Enable tracing
+            )
+
+            if verbose:
+                logger.info(f"Agent invocation response: {response}")
+
+            # Check for successful response
+            if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
+                error_message = f"Agent invocation failed with response: {response}"
+                logger.error(error_message)
+                return {"error": error_message}
+
+            # Process the streaming response
+            agent_answer = ""
+            traces = []
+            for event in response["completion"]:
+                if "chunk" in event:
+                    data = event["chunk"]["bytes"]
+                    agent_answer += data.decode("utf8")
+                if "trace" in event:
+                    traces.append(event["trace"])
+
+            if verbose:
+                logger.info(f"Agent '{agent_name}' response: {agent_answer}")
+                logger.info(f"Agent '{agent_name}' trace: {json.dumps(traces, indent=2)}")
+
+            return {"response": agent_answer, "trace": traces}
+
+        except Exception as e:
+            error_message = f"Error invoking agent '{agent_name}': {str(e)}"
+            logger.error(error_message, exc_info=True)
+            return {"error": error_message}
 
     # -------------------------------------------------------------------------
     # 3.11a: Helper to Process a Single Trace Event
@@ -1552,6 +1619,9 @@ class BedrockAgents:
                 - createdAt: Timestamp when agent was created
                 - lastUpdatedAt: Timestamp of last update
         """
+        self.context.interactive_sleep(10)
+        if verbose:
+            logger.info(f"Getting status for agent '{agent_name}'")
         try:
             # Get agent ID from name
             agent_id = self.get_agent_id_by_name(agent_name)
@@ -1591,41 +1661,239 @@ class BedrockAgents:
             logger.error(error_message, exc_info=True)
             return {"error": error_message}
         
+
+    def new_invoke(
+        self,
+        agent_name: str,
+        input_text: str,
+        verbose: bool = False,
+        session_id: str = str(uuid.uuid4()),
+        session_state: dict = {},
+        enable_trace: bool = True,
+        trace_level: str = "core",
+        end_session: bool = False,
+        multi_agent_names: dict = None
+    ) -> dict:
+        """
+        Invokes a Bedrock Agent with the given input_text, returning:
+        - "response": The final textual answer from the agent
+        - "raw_trace": The list of unmodified JSON 'trace' objects from each event (if enable_trace=True)
+        - "trace": The original streaming response object from the Bedrock service
+        """
+
+        if multi_agent_names is None:
+            multi_agent_names = {}
+
+        chosen_trace_lines = []
+        raw_trace = []
+
+        def _record_chosen_line(line: str):
+            print(line)  # color-coded output in the notebook
+            chosen_trace_lines.append(line)
+
+        try:
+            agent_id = self.get_agent_id_by_name(agent_name, verbose=verbose)
+            if agent_id is None:
+                error_msg = f"Agent '{agent_name}' not found."
+                if verbose:
+                    logger.error(error_msg)
+                return {"error": error_msg}
+
+            if verbose:
+                logger.info(f"Invoking agent '{agent_name}' with input: {input_text}")
+
+            time_before_call = datetime.now()
+
+            invocation_args = {
+                "inputText": input_text,
+                "agentId": agent_id,
+                "agentAliasId": DEFAULT_ALIAS,
+                "sessionId": session_id,
+                "sessionState": session_state,
+                "enableTrace": enable_trace,
+                "endSession": end_session,
+            }
+
+            response = self.bedrock_agent_runtime_client.invoke_agent(**invocation_args)
+            if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
+                error_message = f"API Response was not 200: {response}"
+                if enable_trace:
+                    _record_chosen_line(colored(error_message, "red"))
+                return {"error": error_message}
+
+            event_stream = response["completion"]
+            agent_answer = ""
+
+            # Track usage for on-screen printing.
+            total_in_tokens = 0
+            total_out_tokens = 0
+            total_llm_calls = 0
+            orch_step = 0
+            sub_step = 0
+            time_before_orchestration = datetime.now()
+            sub_agent_name = "<collab-name-not-yet-provided>"
+
+            for event in event_stream:
+                # Accumulate chunk data
+                if "chunk" in event:
+                    agent_answer += event["chunk"]["bytes"].decode("utf8")
+
+                # If there's trace data, optionally parse + store raw
+                if "trace" in event and enable_trace:
+                    trace_obj = event["trace"]
+                    raw_trace.append(trace_obj)
+
+                    # If user literally asked for "all," print entire JSON
+                    if trace_level == "all":
+                        _record_chosen_line("---\n" + json.dumps(trace_obj, indent=2))
+
+                    # Parse the 'trace' subfield (for color-coded output in the notebook)
+                    if "trace" in trace_obj:
+                        self._process_trace_event_overridden(
+                            trace_data=trace_obj["trace"],
+                            trace_level=trace_level,
+                            sub_agent_name=sub_agent_name,
+                            multi_agent_names=multi_agent_names,
+                            total_in_out_llm_usage={
+                                "total_in_tokens": total_in_tokens,
+                                "total_out_tokens": total_out_tokens,
+                                "total_llm_calls": total_llm_calls
+                            },
+                            step_tracking={
+                                "orch_step": orch_step,
+                                "sub_step": sub_step,
+                                "time_before_orchestration": time_before_orchestration
+                            },
+                            record_line_callback=_record_chosen_line
+                        )
+                        # Update counters after each parse
+                        total_in_tokens = self._last_in_tokens
+                        total_out_tokens = self._last_out_tokens
+                        total_llm_calls = self._last_llm_calls
+                        orch_step = self._last_orch_step
+                        sub_step = self._last_sub_step
+                        time_before_orchestration = self._last_time_before_orchestration
+
+            # If user wants a summary
+            if enable_trace:
+                duration = datetime.now() - time_before_call
+                if trace_level in ["core", "outline"]:
+                    usage_msg = colored(
+                        f"Agent made a total of {total_llm_calls} LLM calls, "
+                        f"using {total_in_tokens + total_out_tokens} tokens ("
+                        f"in: {total_in_tokens}, out: {total_out_tokens}), "
+                        f"and took {duration.total_seconds():,.1f} total seconds.",
+                        "yellow"
+                    )
+                    _record_chosen_line(usage_msg)
+                elif trace_level == "all":
+                    _record_chosen_line(f"Returning agent answer as: {agent_answer}")
+
+            # Return final
+            return {
+                "response": agent_answer,
+                "raw_trace": raw_trace,
+                "trace": event_stream
+            }
+
+        except Exception as e:
+            error_message = f"Error invoking agent '{agent_name}': {str(e)}"
+            logger.error(error_message, exc_info=True)
+            return {"error": error_message}
+
+
     # -------------------------------------------------------------------------
     # 3.13: Wait for Agent State
     # -------------------------------------------------------------------------
-    def wait_for_agent_state(self, agent_id: str, target_state: str, 
-                             max_attempts: int = 60, initial_delay: int = 2) -> bool:
+    def wait_for_agent_state(self, agent_name: str, target_state: str, 
+                         max_attempts: int = 100, initial_delay: int = 5) -> bool:
         """
-        Wait for agent to reach target state with exponential backoff.
+        Wait for agent to reach target state with proper state transition handling.
         
         Args:
-            agent_id (str): The ID of the agent to check
+            agent_name (str): Name of the agent to check
             target_state (str): Desired state to wait for
             max_attempts (int): Maximum number of retry attempts
             initial_delay (int): Starting delay in seconds
             
         Returns:
-            bool: True if target state reached, False if timeout
+            bool: True if target state reached, False if timeout or invalid transition
         """
         attempt = 0
         delay = initial_delay
+
         
+        # All valid agent states
+        VALID_STATES = {
+            "CREATING",  # The agent is being created.
+            "PREPARING", # The agent is being prepared.
+            "PREPARED",  # The agent is prepared and ready to be invoked.
+            "NOT_PREPARED", # The agent has been created but not yet prepared.
+            "FAILED",    # The agent API operation failed.
+            "UPDATING",  # The agent is being updated.
+            "DELETING"   # The agent is being deleted.
+        }
+        
+        # # Valid state transitions
+        # VALID_TRANSITIONS = {
+        #     "CREATING": ["PREPARED", "NOT_PREPARED", "FAILED"],
+        #     "PREPARING": ["PREPARED", "FAILED"],
+        #     "PREPARED": ["UPDATING", "DELETING", "NOT_PREPARED"],
+        #     "NOT_PREPARED": ["PREPARING", "DELETING"],
+        #     "FAILED": ["DELETING"],
+        #     "UPDATING": ["PREPARED", "FAILED"],
+        #     "DELETING": ["FAILED"]
+        # }
+
+        logger.info(f"Waiting for agent {agent_name} to reach state {target_state}...")
+
+        status_info = self.get_agent_status(agent_name, verbose=True)
+        logger.info(f"Agent status info: {status_info}")
+        current_state = status_info.get('agentStatus')
+        logger.info(f"Agent in {current_state} state...")
+
+
+        prev_state = None
         while attempt < max_attempts:
-            status_info = self.get_agent_status(agent_id)
-            if isinstance(status_info, dict) and 'agentStatus' in status_info:
-                current_state = status_info['agentStatus']
-                if current_state == target_state:
-                    return True
-                    
-                logger.info(f"Agent in {current_state} state, waiting for {target_state}... (attempt {attempt + 1}/{max_attempts})")
-                time.sleep(delay)
-                delay *= 2
-                attempt += 1
-            else:
-                logger.error(f"Failed to get agent status: {status_info}")
+            status_info = self.get_agent_status(agent_name, verbose=True)
+            
+            if "error" in status_info:
+                if attempt < 3:  # Allow few retries for initial creation
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
                 return False
-        
+
+            current_state = status_info.get('agentStatus')
+            logger.info(f"Agent in {current_state} state, waiting for {target_state}... (attempt {attempt + 1}/{max_attempts})")
+            
+            # Validate state
+            if current_state not in VALID_STATES:
+                logger.error(f"Invalid agent state: {current_state}")
+                return False
+                
+            # Check if target reached
+            if current_state == target_state:
+                return True
+                
+            # # Validate state transition
+            # if prev_state and current_state not in VALID_TRANSITIONS.get(prev_state, []):
+            #     logger.error(f"Invalid state transition: {prev_state} -> {current_state}")
+            #     return False
+                
+            # Handle FAILED state
+            if current_state == "FAILED":
+                logger.error("Agent entered FAILED state")
+                return False
+                
+            logger.info(f"Agent in {current_state} state, waiting for {target_state}... (attempt {attempt + 1}/{max_attempts})")
+            prev_state = current_state
+            
+            # Exponential backoff with max delay of 30 seconds
+            time.sleep(delay)
+            delay = min(delay * 1.5, 30)
+            attempt += 1
+            
         logger.warning(f"Timeout waiting for agent state {target_state} after {max_attempts} attempts")
         return False
     
