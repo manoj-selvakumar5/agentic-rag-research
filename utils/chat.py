@@ -187,6 +187,54 @@ class SyntheticDataGenerator:
 
         """
         self.bedrock_chat = BedrockChat()
+        self.context = AppContext()
+        self.s3_client = self.context.client('s3')
+
+
+    def read_jsonl_from_s3(
+        self,
+        bucket: str,
+        key: str,
+        verbose: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Reads a JSONL file from S3 and returns list of dictionaries.
+
+        Args:
+            bucket (str): Name of S3 bucket
+            key (str): Path to JSONL file in bucket
+            verbose (bool): Enable logging if True
+
+        Returns:
+            List[Dict[str, Any]]: List of parsed JSON records
+
+        Raises:
+            ClientError: If S3 operations fail
+            JSONDecodeError: If JSON parsing fails
+        """
+        try:
+            if verbose:
+                logger.info(f"Reading JSONL from s3://{bucket}/{key}")
+                
+            response = self.s3_client.get_object(Bucket=bucket, Key=key)
+            content = response['Body'].read().decode('utf-8')
+            
+            records = []
+            for line in content.splitlines():
+                if line.strip():  # Skip empty lines
+                    records.append(json.loads(line))
+                    
+            if verbose:
+                logger.info(f"Successfully read {len(records)} records")
+                
+            return records
+            
+        except ClientError as e:
+            logger.error(f"Error reading from S3: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON: {e}")
+            raise 
 
     def generate_forecasting_instructions(self, file_name: str) -> str:
         """

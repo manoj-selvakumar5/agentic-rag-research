@@ -24,6 +24,7 @@ from typing import List, Dict, Optional, Tuple, Any
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 from datetime import datetime
+from dataclasses import dataclass
 
 # For colored printing in the trace (like the reference code)
 try:
@@ -137,6 +138,23 @@ DEFAULT_AGENT_IAM_POLICY = {
 # For optional trace logic
 TRACE_TRUNCATION_LENGTH = 1000000
 UNDECIDABLE_CLASSIFICATION = 'undecidable'
+
+
+@dataclass
+class Citation:
+    """Stores reference information from knowledge base lookups"""
+    text: str  
+    source_uri: str
+    page_number: Optional[float]
+    chunk_id: str
+
+@dataclass 
+class AgentResponse:
+    """Encapsulates complete agent response including citations"""
+    generated_text: str
+    citations: List[Citation]
+    raw_trace: List[Dict[str, Any]]
+    trace: Dict[str, Any]
 
 # -----------------------------------------------------------------------------
 # 2. Centralized AppContext
@@ -1078,327 +1096,6 @@ class BedrockAgents:
             logger.error(f"Error adding code interpreter to agent '{agent_name}': {e}", exc_info=True)
 
     # -------------------------------------------------------------------------
-    # 3.11: Invoke a Bedrock Agent (Extended Tracing)
-    # -------------------------------------------------------------------------
-    def invoke(
-        self,
-        agent_name: str,
-        input_text: str,
-        verbose: bool = False,
-        session_id: str = str(uuid.uuid4()),
-        session_state: dict = {},
-        enable_trace: bool = True,
-        trace_level: str = "core",
-        end_session: bool = False,
-        multi_agent_names: dict = None,
-        save_trace_json_file: str = None  # <-- If provided, we'll save everything
-    ) -> dict:
-        """
-        Invokes a Bedrock Agent with the given input_text. Displays color-coded output
-        in the notebook at the chosen `trace_level` (e.g. 'core' or 'outline'), but also
-        collects a fully verbose set of color-coded lines plus the raw JSON trace
-        in the final saved file, so you can inspect everything offline.
-
-        The final JSON contains:
-        - "response": the final textual answer from the agent.
-        - "session_id": the session ID used during invocation.
-        - "chosen_trace_level": e.g. 'core', 'outline', or 'all'.
-        - "chosen_trace_lines": color-coded lines at your chosen trace level.
-        - "all_trace_lines": color-coded lines at forced 'all' level (fully verbose).
-        - "all_trace_raw": a list of the raw 'trace' JSON objects (unmodified).
-        """
-        if multi_agent_names is None:
-            multi_agent_names = {}
-
-        # A list for the lines at the user-chosen trace level (printed on-screen).
-        chosen_trace_lines = []
-        # A separate list for the fully verbose "all" lines (not printed on-screen).
-        all_trace_lines = []
-        # A list for storing the raw JSON objects from each event.
-        all_trace_raw = []
-
-        # -------------------------------------------------------------------------
-        # Helper to print + store lines at the user-chosen trace level
-        # -------------------------------------------------------------------------
-        def _record_chosen_line(line: str):
-            print(line)  # so you see it live in the notebook
-            chosen_trace_lines.append(line)
-
-        # -------------------------------------------------------------------------
-        # Helper to store lines for the forced "all" parse (no on-screen print)
-        # -------------------------------------------------------------------------
-        def _record_all_line(line: str):
-            all_trace_lines.append(line)
-
-        # -------------------------------------------------------------------------
-        # 1) Actually invoke the agent
-        # -------------------------------------------------------------------------
-        try:
-            agent_id = self.get_agent_id_by_name(agent_name, verbose=verbose)
-            if agent_id is None:
-                error_msg = f"Agent '{agent_name}' not found."
-                if verbose:
-                    logger.error(error_msg)
-                return {"error": error_msg}
-
-            if verbose:
-                logger.info(f"Invoking agent '{agent_name}' with input: {input_text}")
-
-            time_before_call = datetime.now()
-
-            invocation_args = {
-                "inputText": input_text,
-                "agentId": agent_id,
-                "agentAliasId": DEFAULT_ALIAS,
-                "sessionId": session_id,
-                "sessionState": session_state,
-                "enableTrace": enable_trace,
-                "endSession": end_session,
-            }
-
-            response = self.bedrock_agent_runtime_client.invoke_agent(**invocation_args)
-            if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
-                error_message = f"API Response was not 200: {response}"
-                if enable_trace:
-                    # Print an error in color
-                    _record_chosen_line(colored(error_message, "red"))
-                return {"error": error_message}
-
-            event_stream = response["completion"]
-            agent_answer = ""
-
-            # Track usage for the chosen parse
-            total_in_tokens = 0
-            total_out_tokens = 0
-            total_llm_calls = 0
-            orch_step = 0
-            sub_step = 0
-            time_before_orchestration = datetime.now()
-            sub_agent_name = "<collab-name-not-yet-provided>"
-
-            # Track usage for the forced "all" parse
-            total_in_tokens_all = 0
-            total_out_tokens_all = 0
-            total_llm_calls_all = 0
-            orch_step_all = 0
-            sub_step_all = 0
-            time_before_orchestration_all = datetime.now()
-            sub_agent_name_all = "<collab-name-not-yet-provided>"
-
-            # ---------------------------------------------------------------------
-            # 2) Stream events. For each trace event, we store the raw JSON, parse
-            #    at the chosen level, and parse at the forced 'all' level.
-            # ---------------------------------------------------------------------
-            for event in event_stream:
-                # 2a) If there's chunk data, accumulate in agent_answer
-                if "chunk" in event:
-                    chunk_bytes = event["chunk"]["bytes"]
-                    agent_answer += chunk_bytes.decode("utf8")
-
-                # 2b) If there's trace data
-                if "trace" in event and enable_trace:
-                    trace_obj = event["trace"]
-
-                    # (i) Save the entire raw trace object for offline inspection
-                    all_trace_raw.append(trace_obj)
-
-                    # (ii) If user literally asked for "all" on-screen, print it
-                    if trace_level == "all":
-                        _record_chosen_line("---\n" + json.dumps(trace_obj, indent=2))
-
-                    # Possibly handle sub-agent name if there's a callerChain
-                    if "callerChain" in trace_obj and len(trace_obj["callerChain"]) > 1:
-                        sub_agent_alias_arn = trace_obj["callerChain"][1]["agentAliasArn"]
-                        sub_agent_alias_id = sub_agent_alias_arn.split("/", 1)[1]
-                        if sub_agent_alias_id in multi_agent_names:
-                            sub_agent_name = multi_agent_names[sub_agent_alias_id]
-                        else:
-                            _record_chosen_line(colored(
-                                "You haven't provided sub-agent name in 'multi_agent_names'.",
-                                "yellow"
-                            ))
-                            sub_agent_name = "<not-yet-provided>"
-
-                    # (iii) If there's an internal 'trace' subfield, parse it
-                    if "trace" in trace_obj:
-                        # [1] Parse for the user-chosen trace level
-                        self._process_trace_event_overridden(
-                            trace_data=trace_obj["trace"],
-                            trace_level=trace_level,
-                            sub_agent_name=sub_agent_name,
-                            multi_agent_names=multi_agent_names,
-                            total_in_out_llm_usage={
-                                "total_in_tokens": total_in_tokens,
-                                "total_out_tokens": total_out_tokens,
-                                "total_llm_calls": total_llm_calls
-                            },
-                            step_tracking={
-                                "orch_step": orch_step,
-                                "sub_step": sub_step,
-                                "time_before_orchestration": time_before_orchestration
-                            },
-                            record_line_callback=_record_chosen_line
-                        )
-                        # Update chosen-level counters
-                        total_in_tokens = self._last_in_tokens
-                        total_out_tokens = self._last_out_tokens
-                        total_llm_calls = self._last_llm_calls
-                        orch_step = self._last_orch_step
-                        sub_step = self._last_sub_step
-                        time_before_orchestration = self._last_time_before_orchestration
-
-                        # [2] Parse again for the forced "all" level (not printed)
-                        # Possibly handle sub-agent name again
-                        if "callerChain" in trace_obj and len(trace_obj["callerChain"]) > 1:
-                            sub_agent_alias_arn_all = trace_obj["callerChain"][1]["agentAliasArn"]
-                            sub_agent_alias_id_all = sub_agent_alias_arn_all.split("/", 1)[1]
-                            if sub_agent_alias_id_all in multi_agent_names:
-                                sub_agent_name_all = multi_agent_names[sub_agent_alias_id_all]
-                            else:
-                                sub_agent_name_all = "<not-yet-provided>"
-
-                        self._process_trace_event_overridden(
-                            trace_data=trace_obj["trace"],
-                            trace_level="all",  # forced all
-                            sub_agent_name=sub_agent_name_all,
-                            multi_agent_names=multi_agent_names,
-                            total_in_out_llm_usage={
-                                "total_in_tokens": total_in_tokens_all,
-                                "total_out_tokens": total_out_tokens_all,
-                                "total_llm_calls": total_llm_calls_all
-                            },
-                            step_tracking={
-                                "orch_step": orch_step_all,
-                                "sub_step": sub_step_all,
-                                "time_before_orchestration": time_before_orchestration_all
-                            },
-                            record_line_callback=_record_all_line  # no on-screen printing
-                        )
-                        # Update all-level counters
-                        total_in_tokens_all = self._last_in_tokens
-                        total_out_tokens_all = self._last_out_tokens
-                        total_llm_calls_all = self._last_llm_calls
-                        orch_step_all = self._last_orch_step
-                        sub_step_all = self._last_sub_step
-                        time_before_orchestration_all = self._last_time_before_orchestration
-
-            # ---------------------------------------------------------------------
-            # 3) Summarize usage for the on-screen chosen level
-            # ---------------------------------------------------------------------
-            if enable_trace:
-                duration = datetime.now() - time_before_call
-                # If user selected 'core' or 'outline', we do a final usage line
-                if trace_level in ["core", "outline"]:
-                    usage_msg = colored(
-                        f"Agent made a total of {total_llm_calls} LLM calls, "
-                        f"using {total_in_tokens + total_out_tokens} tokens "
-                        f"(in: {total_in_tokens}, out: {total_out_tokens}), "
-                        f"and took {duration.total_seconds():,.1f} total seconds.",
-                        "yellow"
-                    )
-                    _record_chosen_line(usage_msg)
-                elif trace_level == "all":
-                    _record_chosen_line(f"Returning agent answer as: {agent_answer}")
-
-            # ---------------------------------------------------------------------
-            # 4) Optionally save to JSON
-            # ---------------------------------------------------------------------
-            if save_trace_json_file is not None:
-                # Build the final structure
-                output_dict = {
-                    "response": agent_answer,
-                    "session_id": session_id,
-                    "chosen_trace_level": trace_level,
-                    "chosen_trace_lines": chosen_trace_lines,
-                    "all_trace_lines": all_trace_lines,
-                    # This is the raw unmodified JSON for each trace event
-                    # so you can see the entire text in full detail:
-                    "all_trace_raw": all_trace_raw
-                }
-                # Write it out
-                with open(save_trace_json_file, "w", encoding="utf-8") as f:
-                    json.dump(output_dict, f, indent=2, ensure_ascii=False)
-
-            # 5) Return final result
-            return {
-                "response": agent_answer,
-                "trace": event_stream
-            }
-
-        except Exception as e:
-            error_message = f"Error invoking agent '{agent_name}': {str(e)}"
-            logger.error(error_message, exc_info=True)
-            return {"error": error_message}
-
-
-    
-    def simple_invoke(self, agent_name: str, input_text: str, verbose: bool = False) -> dict:
-        """
-        Invokes a Bedrock Agent with a string of input text, returning the response and trace.
-
-        Args:
-            agent_name (str): Name of the agent to invoke.
-            input_text (str): Text to provide as input.
-            verbose (bool, optional): If True, logs additional info.
-
-        Returns:
-            dict: A dictionary containing the agent's response and trace information.
-        """
-        try:
-            # Find the agent by name
-            agent_id = self.get_agent_id_by_name(agent_name)
-            if agent_id is None:
-                if verbose:
-                    logger.error(f"Agent '{agent_name}' not found.")
-                return {"error": "Agent not found"}
-
-            if verbose:
-                logger.info(f"Invoking agent '{agent_name}' with input: {input_text}")
-
-            # Generate a fresh session ID
-            session_id = str(uuid.uuid4())
-
-            # Call the agent with tracing enabled
-            response = self.bedrock_agent_runtime_client.invoke_agent(
-                inputText=input_text,
-                agentId=agent_id,
-                agentAliasId=DEFAULT_ALIAS,
-                sessionId=session_id,
-                sessionState={},
-                enableTrace=True  # Enable tracing
-            )
-
-            if verbose:
-                logger.info(f"Agent invocation response: {response}")
-
-            # Check for successful response
-            if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
-                error_message = f"Agent invocation failed with response: {response}"
-                logger.error(error_message)
-                return {"error": error_message}
-
-            # Process the streaming response
-            agent_answer = ""
-            traces = []
-            for event in response["completion"]:
-                if "chunk" in event:
-                    data = event["chunk"]["bytes"]
-                    agent_answer += data.decode("utf8")
-                if "trace" in event:
-                    traces.append(event["trace"])
-
-            if verbose:
-                logger.info(f"Agent '{agent_name}' response: {agent_answer}")
-                logger.info(f"Agent '{agent_name}' trace: {json.dumps(traces, indent=2)}")
-
-            return {"response": agent_answer, "trace": traces}
-
-        except Exception as e:
-            error_message = f"Error invoking agent '{agent_name}': {str(e)}"
-            logger.error(error_message, exc_info=True)
-            return {"error": error_message}
-
-    # -------------------------------------------------------------------------
     # 3.11a: Helper to Process a Single Trace Event
     # -------------------------------------------------------------------------
     def _process_trace_event_overridden(
@@ -1661,8 +1358,13 @@ class BedrockAgents:
             logger.error(error_message, exc_info=True)
             return {"error": error_message}
         
+    
+        
+    # -------------------------------------------------------------------------
+    # 3.13: Invoke a Bedrock Agent
+    # -------------------------------------------------------------------------
 
-    def new_invoke(
+    def invoke(
         self,
         agent_name: str,
         input_text: str,
@@ -1789,9 +1491,12 @@ class BedrockAgents:
                 elif trace_level == "all":
                     _record_chosen_line(f"Returning agent answer as: {agent_answer}")
 
+            citations = self._extract_citations_from_trace(raw_trace)
+
             # Return final
             return {
                 "response": agent_answer,
+                "citations": citations,
                 "raw_trace": raw_trace,
                 "trace": event_stream
             }
@@ -1834,16 +1539,6 @@ class BedrockAgents:
             "DELETING"   # The agent is being deleted.
         }
         
-        # # Valid state transitions
-        # VALID_TRANSITIONS = {
-        #     "CREATING": ["PREPARED", "NOT_PREPARED", "FAILED"],
-        #     "PREPARING": ["PREPARED", "FAILED"],
-        #     "PREPARED": ["UPDATING", "DELETING", "NOT_PREPARED"],
-        #     "NOT_PREPARED": ["PREPARING", "DELETING"],
-        #     "FAILED": ["DELETING"],
-        #     "UPDATING": ["PREPARED", "FAILED"],
-        #     "DELETING": ["FAILED"]
-        # }
 
         logger.info(f"Waiting for agent {agent_name} to reach state {target_state}...")
 
@@ -1853,7 +1548,6 @@ class BedrockAgents:
         logger.info(f"Agent in {current_state} state...")
 
 
-        prev_state = None
         while attempt < max_attempts:
             status_info = self.get_agent_status(agent_name, verbose=True)
             
@@ -1876,10 +1570,6 @@ class BedrockAgents:
             if current_state == target_state:
                 return True
                 
-            # # Validate state transition
-            # if prev_state and current_state not in VALID_TRANSITIONS.get(prev_state, []):
-            #     logger.error(f"Invalid state transition: {prev_state} -> {current_state}")
-            #     return False
                 
             # Handle FAILED state
             if current_state == "FAILED":
@@ -2100,7 +1790,40 @@ class BedrockAgents:
                 raise RuntimeError(f"Error while monitoring agent {agent_id}: {e}")
                 
 
+    # -------------------------------------------------------------------------
+    # 3.18: Extract citations from trace
+    # -------------------------------------------------------------------------
 
+    def _extract_citations_from_trace(self, raw_trace: List[dict]) -> List[Citation]:
+        """
+        Extracts citation information from raw trace KB responses.
+        
+        Args:
+            raw_trace: List of trace events from agent invocation
+            
+        Returns:
+            List of Citation objects containing reference details
+        """
+        citations = []
+        
+        for trace_event in raw_trace:
+            if 'trace' in trace_event:
+                trace_obj = trace_event['trace']
+                if 'orchestrationTrace' in trace_obj:
+                    orch_trace = trace_obj['orchestrationTrace']
+                    if 'observation' in orch_trace:
+                        obs = orch_trace['observation']
+                        if 'knowledgeBaseLookupOutput' in obs:
+                            kb_output = obs['knowledgeBaseLookupOutput']
+                            if 'retrievedReferences' in kb_output:
+                                for ref in kb_output['retrievedReferences']:
+                                    citations.append(Citation(
+                                        text=ref['content']['text'],
+                                        source_uri=ref['location']['s3Location']['uri'],
+                                        page_number=ref['metadata'].get('x-amz-bedrock-kb-document-page-number'),
+                                        chunk_id=ref['metadata']['x-amz-bedrock-kb-chunk-id']
+                                    ))
+        return citations
 
 # -----------------------------------------------------------------------------
 # 4. AWSResourceManager Class

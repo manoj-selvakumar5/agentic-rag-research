@@ -14,6 +14,7 @@ import boto3
 import json
 import time
 from datetime import datetime
+from dataclasses import dataclass
 
 from typing import List, Dict, Optional, Tuple, Any
 from botocore.exceptions import ClientError
@@ -500,6 +501,19 @@ class VectorStoreConfiguration:
             return {}
 
 
+# Using @dataclass automatically generates several useful methods like __init__, __repr__, and __eq__, making these classes convenient for handling structured data. 
+@dataclass
+class Citation:
+    text: str
+    source: str
+    page_number: Optional[float] # this field can either be a float or None
+    chunk_id: str
+
+@dataclass
+class KBResponse:
+    generated_text: str
+    citations: List[Citation]
+
 # -----------------------------------------------------------------------------
 # 5. Main Knowledge Base Management Class
 # -----------------------------------------------------------------------------
@@ -514,6 +528,7 @@ class BedrockKnowledgeBases:
         self.s3_client = self.context.client('s3')
         self.iam_client = self.context.client('iam')
         self.bedrock_agent_client = self.context.client('bedrock-agent')
+        self.bedrock_agent_runtime_client = self.context.client('bedrock-agent-runtime')
         self.vector_store_configuration = VectorStoreConfiguration(self.context)
 
     def build_chunking_strategy(
@@ -943,3 +958,103 @@ class BedrockKnowledgeBases:
 
         logger.info(f"Final ingestion job status: {job['status']}")
         logger.info("Here are the job details:" + json.dumps(job, indent=2, default=self.context.default_serializer))
+
+
+
+
+    # -----------------------------------------------------------------------------
+    def retrieve_and_generate_from_kb(
+        self,
+        query: str,
+        kb_id: str,
+        num_results: int = 5,
+        prompt_template: Optional[str] = None,
+        model_id: str = "anthropic.claude-3-sonnet-20240229-v1:0",
+        region: str = "us-east-1",
+        verbose: bool = False
+    ) -> KBResponse:
+        """
+        Retrieves information from a knowledge base and generates a response using Amazon Bedrock.
+        
+        Args:
+            query (str): The input query text
+            kb_id (str): The knowledge base ID
+            num_results (int, optional): Number of results to retrieve. Defaults to 5.
+            prompt_template (str, optional): Custom prompt template for generation.
+            model_id (str, optional): Foundation model ID. Defaults to Claude 3.
+            region (str, optional): AWS region. Defaults to "us-east-1".
+            verbose (bool, optional): Enable detailed logging. Defaults to False.
+        
+        Returns:
+            str: The generated response text
+            
+        Raises:
+            Exception: If there's an error during the retrieve and generate operation
+        """
+        try:
+            if verbose:
+                logger.info(f"Starting retrieve and generate for KB: {kb_id}")
+                logger.info(f"Query: {query}")
+                logger.info(f"Model: {model_id}")
+                
+            config = {
+                'knowledgeBaseId': kb_id,
+                'modelArn': f'arn:aws:bedrock:{region}::foundation-model/{model_id}',
+                'retrievalConfiguration': {
+                    'vectorSearchConfiguration': {
+                        'numberOfResults': num_results,
+                        'overrideSearchType': 'SEMANTIC'
+                    }
+                }
+            }
+            
+            if prompt_template:
+                if verbose:
+                    logger.info(f"Using custom prompt template: {prompt_template}")
+                config['generationConfiguration'] = {
+                    'promptTemplate': {
+                        'textPromptTemplate': prompt_template
+                    }
+                }
+                
+            if verbose:
+                logger.info("Sending retrieve and generate request...")
+                
+            response = self.bedrock_agent_runtime_client.retrieve_and_generate(
+                input={
+                    'text': query
+                },
+                retrieveAndGenerateConfiguration={
+                    'type': 'KNOWLEDGE_BASE',
+                    'knowledgeBaseConfiguration': config
+                }
+            )
+            
+            if verbose:
+                logger.info("Response received successfully")
+                logger.info(f"Response details: {json.dumps(response, indent=2, default=self.context.default_serializer)}")
+
+            
+                
+            # Extract citations
+            citations = []
+            for citation in response.get('citations', []):
+                for ref in citation.get('retrievedReferences', []):
+                    citations.append(Citation(
+                        text=ref['content']['text'],
+                        source=ref['location']['s3Location']['uri'],
+                        page_number=ref['metadata'].get('x-amz-bedrock-kb-document-page-number'),
+                        chunk_id=ref['metadata']['x-amz-bedrock-kb-chunk-id']
+                    ))
+
+            if verbose:
+                logger.info(f"Extracted {len(citations)} citations")
+                
+            return KBResponse(
+                generated_text=response['output']['text'],
+                citations=citations
+            )
+
+        except Exception as e:
+            logger.error(f"Error during retrieve and generate: {str(e)}")
+            raise
