@@ -1372,9 +1372,11 @@ class BedrockAgents:
         session_id: str = str(uuid.uuid4()),
         session_state: dict = {},
         enable_trace: bool = True,
-        trace_level: str = "core",
+        trace_level: str = None,
         end_session: bool = False,
-        multi_agent_names: dict = None
+        kb_id: str = None,
+        num_results: int = 5,
+        multi_agent_names: dict = None,
     ) -> dict:
         """
         Invokes a Bedrock Agent with the given input_text, returning:
@@ -1390,8 +1392,9 @@ class BedrockAgents:
         raw_trace = []
 
         def _record_chosen_line(line: str):
-            print(line)  # color-coded output in the notebook
-            chosen_trace_lines.append(line)
+            if trace_level is not None:     # Only print if trace_level is set to something other than None
+                print(line)  # color-coded output in the notebook
+                chosen_trace_lines.append(line)
 
         try:
             agent_id = self.get_agent_id_by_name(agent_name, verbose=verbose)
@@ -1416,10 +1419,21 @@ class BedrockAgents:
                 "endSession": end_session,
             }
 
+            if kb_id:
+                invocation_args["sessionState"]["knowledgeBaseConfigurations"] = [{
+                    "knowledgeBaseId": kb_id,
+                    "retrievalConfiguration": {
+                        "vectorSearchConfiguration": {
+                            "numberOfResults": num_results,
+                            "overrideSearchType": "SEMANTIC"
+                        }
+                    }
+                }]
+
             response = self.bedrock_agent_runtime_client.invoke_agent(**invocation_args)
             if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
                 error_message = f"API Response was not 200: {response}"
-                if enable_trace:
+                if enable_trace and trace_level is not None:        # Only print if trace_level is set to something other than None
                     _record_chosen_line(colored(error_message, "red"))
                 return {"error": error_message}
 
@@ -1444,6 +1458,7 @@ class BedrockAgents:
                 if "trace" in event and enable_trace:
                     trace_obj = event["trace"]
                     raw_trace.append(trace_obj)
+
 
                     # If user literally asked for "all," print entire JSON
                     if trace_level == "all":
@@ -1477,7 +1492,7 @@ class BedrockAgents:
                         time_before_orchestration = self._last_time_before_orchestration
 
             # If user wants a summary
-            if enable_trace:
+            if enable_trace and trace_level is not None:        # Only print if trace_level is set to something other than None
                 duration = datetime.now() - time_before_call
                 if trace_level in ["core", "outline"]:
                     usage_msg = colored(

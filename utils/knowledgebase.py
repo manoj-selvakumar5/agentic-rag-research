@@ -919,7 +919,7 @@ class BedrockKnowledgeBases:
             # Delete the collection
             aoss.delete_aoss_collection(collection_id)
         else:
-            logger.warning(f"No AOSS collection found for name '{vector_store_name}'. Skipping collection deletion.")
+            logger.warning(f"No AOSS collection found for vector store '{vector_store_name}'. Skipping collection deletion.")
 
         # 5) Delete AOSS policies
         encryption_policy_name = NameGenerator.generate_policy_name(vector_store_name, "en")
@@ -967,9 +967,9 @@ class BedrockKnowledgeBases:
         self,
         query: str,
         kb_id: str,
+        model_id: str,
         num_results: int = 5,
         prompt_template: Optional[str] = None,
-        model_id: str = "anthropic.claude-3-sonnet-20240229-v1:0",
         region: str = "us-east-1",
         verbose: bool = False
     ) -> KBResponse:
