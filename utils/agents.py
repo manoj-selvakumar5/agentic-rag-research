@@ -25,6 +25,7 @@ from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 from datetime import datetime
 from dataclasses import dataclass
+import re
 
 # For colored printing in the trace (like the reference code)
 try:
@@ -1808,7 +1809,6 @@ class BedrockAgents:
     # -------------------------------------------------------------------------
     # 3.18: Extract citations from trace
     # -------------------------------------------------------------------------
-
     def _extract_citations_from_trace(self, raw_trace: List[dict]) -> List[Citation]:
         """
         Extracts citation information from raw trace KB responses.
@@ -1820,7 +1820,7 @@ class BedrockAgents:
             List of Citation objects containing reference details
         """
         citations = []
-        
+
         for trace_event in raw_trace:
             if 'trace' in trace_event:
                 trace_obj = trace_event['trace']
@@ -1831,14 +1831,74 @@ class BedrockAgents:
                         if 'knowledgeBaseLookupOutput' in obs:
                             kb_output = obs['knowledgeBaseLookupOutput']
                             if 'retrievedReferences' in kb_output:
-                                for ref in kb_output['retrievedReferences']:
-                                    citations.append(Citation(
-                                        text=ref['content']['text'],
-                                        source_uri=ref['location']['s3Location']['uri'],
-                                        page_number=ref['metadata'].get('x-amz-bedrock-kb-document-page-number'),
-                                        chunk_id=ref['metadata']['x-amz-bedrock-kb-chunk-id']
-                                    ))
+                                retrieved_references = kb_output['retrievedReferences']
+                                print(f"Retrieved references: {retrieved_references}")
+        
+                                if 'rawResponse' in obs:
+                                    raw_response = obs['rawResponse']['content']
+                                    print(f"rawResponse: {raw_response}")
+                                    source_numbers = re.findall(r'<source>(\d+)</source>', raw_response)
+                                    source_indices = [int(num) - 1 for num in source_numbers]
+
+                                    for index in source_indices:
+                                        if 0 <= index < len(retrieved_references):
+                                            ref = retrieved_references[index]
+                                            citations.append(Citation(
+                                                text=ref['content']['text'],
+                                                source_uri=ref['location']['s3Location']['uri'],
+                                                page_number=ref['metadata'].get('x-amz-bedrock-kb-document-page-number'),
+                                                chunk_id=ref['metadata']['x-amz-bedrock-kb-chunk-id']
+                                            ))
         return citations
+
+    # def _extract_citations_from_trace(self, raw_trace: List[dict]) -> List[Citation]:
+    #     """
+    #     Extracts citation information from raw trace KB responses.
+        
+    #     Args:
+    #         raw_trace: List of trace events from agent invocation
+            
+    #     Returns:
+    #         List of Citation objects containing reference details
+    #     """
+    #     citations = []
+        
+    #     for trace_event in raw_trace:
+    #         if 'trace' in trace_event:
+    #             trace_obj = trace_event['trace']
+    #             if 'orchestrationTrace' in trace_obj:
+    #                 orch_trace = trace_obj['orchestrationTrace']
+    #                 if 'observation' in orch_trace:
+    #                     obs = orch_trace['observation']
+    #                     if 'knowledgeBaseLookupOutput' in obs:
+    #                         kb_output = obs['knowledgeBaseLookupOutput']
+    #                         # if 'retrievedReferences' in kb_output:
+    #                         #     for ref in kb_output['retrievedReferences']:
+    #                         #         citations.append(Citation(
+    #                         #             text=ref['content']['text'],
+    #                         #             source_uri=ref['location']['s3Location']['uri'],
+    #                         #             page_number=ref['metadata'].get('x-amz-bedrock-kb-document-page-number'),
+    #                         #             chunk_id=ref['metadata']['x-amz-bedrock-kb-chunk-id']
+    #                         #         ))
+
+    #                         if 'retrievedReferences' in kb_output:
+    #                             retrieved_references = kb_output['retrievedReferences']
+    #                             if 'rawResponse' in obs:
+    #                                 raw_response = obs['rawResponse']['content']
+    #                                 print("Raw Response", raw_response)
+    #                                 source_numbers = re.findall(r'<source>(\d+)</source>', raw_response)
+    #                                 source_indices = [int(num) - 1 for num in source_numbers]
+
+    #                                 for index in source_indices:
+    #                                     if 0 <= index < len(retrieved_references):
+    #                                         ref = retrieved_references[index]
+    #                                         citations.append(Citation(
+    #                                             text=ref['content']['text'],
+    #                                             source_uri=ref['location']['s3Location']['uri'],
+    #                                             page_number=ref['metadata'].get('x-amz-bedrock-kb-document-page-number'),
+    #                                             chunk_id=ref['metadata']['x-amz-bedrock-kb-chunk-id']
+    #                                         ))
+    #     return citations
 
 # -----------------------------------------------------------------------------
 # 4. AWSResourceManager Class
