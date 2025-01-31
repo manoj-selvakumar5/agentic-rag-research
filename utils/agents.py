@@ -1809,7 +1809,7 @@ class BedrockAgents:
     # -------------------------------------------------------------------------
     # 3.18: Extract citations from trace
     # -------------------------------------------------------------------------
-    def _extract_citations_from_trace(self, raw_trace: List[dict]) -> List[Citation]:
+   def _extract_citations_from_trace(self, raw_trace: List[dict]) -> List[Citation]:
         """
         Extracts citation information from raw trace KB responses.
         
@@ -1832,11 +1832,8 @@ class BedrockAgents:
                             kb_output = obs['knowledgeBaseLookupOutput']
                             if 'retrievedReferences' in kb_output:
                                 retrieved_references = kb_output['retrievedReferences']
-                                print(f"Retrieved references: {retrieved_references}")
-        
                                 if 'rawResponse' in obs:
                                     raw_response = obs['rawResponse']['content']
-                                    print(f"rawResponse: {raw_response}")
                                     source_numbers = re.findall(r'<source>(\d+)</source>', raw_response)
                                     source_indices = [int(num) - 1 for num in source_numbers]
 
