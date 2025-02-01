@@ -1,0 +1,96 @@
+{
+    "shipping": {
+        "properties": {
+            "order_id": {
+                "type": "keyword"
+            },
+            "tracking_number": {
+                "type": "keyword"
+            },
+            "status": {
+                "type": "keyword"
+            },
+            "created_at": {
+                "type": "date"
+            },
+            "sender": {
+                "properties": {
+                    "name": {
+                        "type": "text"
+                    },
+                    "email": {
+                        "type": "keyword"
+                    },
+                    "address": {
+                        "type": "text"
+                    },
+                    "city": {
+                        "type": "keyword"
+                    },
+                    "country": {
+                        "type": "keyword"
+                    }
+                }
+            },
+            "recipient": {
+                "properties": {
+                    "name": {
+                        "type": "text"
+                    },
+                    "email": {
+                        "type": "keyword"
+                    },
+                    "address": {
+                        "type": "text"
+                    },
+                    "city": {
+                        "type": "keyword"
+                    },
+                    "country": {
+                        "type": "keyword"
+                    }
+                }
+            },
+            "package": {
+                "properties": {
+                    "weight": {
+                        "type": "float"
+                    },
+                    "description": {
+                        "type": "text"
+                    },
+                    "value": {
+                        "type": "float"
+                    }
+                }
+            },
+            "delivery": {
+                "properties": {
+                    "carrier": {
+                        "type": "keyword"
+                    },
+                    "estimated_date": {
+                        "type": "date"
+                    },
+                    "shipping_cost": {
+                        "type": "float"
+                    }
+                }
+            },
+            "tracking": {
+                "type": "nested",
+                "properties": {
+                    "timestamp": {
+                        "type": "date"
+                    },
+                    "status": {
+                        "type": "keyword"
+                    },
+                    "location": {
+                        "type": "keyword"
+                    }
+                }
+            }
+        }
+    }
+}
