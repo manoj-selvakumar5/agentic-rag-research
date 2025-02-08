@@ -1375,21 +1375,56 @@ class AgentsForAmazonBedrock:
         # When trace is enabled and trace_level is 'all', dump the entire
         # raw response (including event stream) to a JSON file named "trace.json".
         if enable_trace and trace_level == "all":
-            agent_resp_for_json = copy.deepcopy(_agent_resp)
-            # Convert any binary fields (like 'chunk'->'bytes' or 'files'->'bytes') to base64
-            if "completion" in agent_resp_for_json:
-                for event_obj in agent_resp_for_json["completion"]:
-                    if "chunk" in event_obj and "bytes" in event_obj["chunk"]:
-                        event_obj["chunk"]["bytes"] = base64.b64encode(
-                            event_obj["chunk"]["bytes"]
-                        ).decode("utf-8")
-                    if "files" in event_obj:
-                        for file_obj in event_obj["files"].get("files", []):
-                            if "bytes" in file_obj:
-                                file_obj["bytes"] = base64.b64encode(
-                                    file_obj["bytes"]
-                                ).decode("utf-8")
+            # Create a new dict so we never call copy.deepcopy on the entire response
+            agent_resp_for_json = {}
 
+            # Copy fields from the original response one-by-one
+            # leaving out or manually transforming the "completion" event stream
+            for key, value in _agent_resp.items():
+                if key != "completion":
+                    # For the top-level fields (like ResponseMetadata, sessionState, etc.),
+                    # just assign them directly if they’re safe to copy
+                    agent_resp_for_json[key] = value
+                else:
+                    # For the "completion" event list, build a new list of event objects
+                    # converting any raw bytes to base64
+                    new_completion = []
+                    for event_obj in value:
+                        # Shallow-copy the event so we can transform bytes
+                        transformed_event = {}
+
+                        for ek, ev in event_obj.items():
+                            if ek == "chunk" and "bytes" in ev:
+                                # base64-encode the bytes
+                                new_chunk = {
+                                    "bytes": base64.b64encode(ev["bytes"]).decode("utf-8")
+                                }
+                                # If there is other data in 'chunk' we want to keep,
+                                # copy them over:
+                                if "attribution" in ev:
+                                    new_chunk["attribution"] = ev["attribution"]
+                                # etc...
+                                transformed_event["chunk"] = new_chunk
+                            elif ek == "files":
+                                # The "files" section can also have raw bytes
+                                new_files = {"files": []}
+                                for file_obj in ev["files"]:
+                                    file_copy = dict(file_obj)
+                                    if "bytes" in file_copy:
+                                        file_copy["bytes"] = base64.b64encode(
+                                            file_copy["bytes"]
+                                        ).decode("utf-8")
+                                    new_files["files"].append(file_copy)
+                                transformed_event["files"] = new_files
+                            else:
+                                # For non-binary fields (like trace, or text fields):
+                                transformed_event[ek] = ev
+
+                        new_completion.append(transformed_event)
+
+                    agent_resp_for_json["completion"] = new_completion
+
+            # Now dump to JSON
             with open("trace.json", "w", encoding="utf-8") as f:
                 json.dump(agent_resp_for_json, f, indent=2)
             ####################################################################
