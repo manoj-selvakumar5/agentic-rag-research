@@ -673,7 +673,7 @@ class AgentsForAmazonBedrock:
                 agentDescriptor={"aliasArn": sub_agent["sub_agent_alias_arn"]},
                 collaboratorName=sub_agent["sub_agent_association_name"],
                 collaborationInstruction=sub_agent["sub_agent_instruction"],
-                relay_conversation_history=sub_agent["relay_conversation_history"],
+                relayConversationHistory=sub_agent["relay_conversation_history"],
             )
             self.wait_agent_status_update(supervisor_agent_id)
             self._bedrock_agent_client.prepare_agent(agentId=supervisor_agent_id)
