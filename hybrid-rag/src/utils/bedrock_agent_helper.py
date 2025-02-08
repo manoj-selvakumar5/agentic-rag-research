@@ -30,7 +30,8 @@ from boto3.dynamodb.conditions import Key
 from termcolor import colored
 from rich.console import Console
 from rich.markdown import Markdown
-
+import base64
+import copy
 
 PYTHON_TIMEOUT = 180
 PYTHON_RUNTIME = "python3.12"
@@ -114,10 +115,6 @@ DEFAULT_AGENT_IAM_POLICY = {
         },
     ],
 }
-
-# # setting logger
-# logging.basicConfig(format='[%(asctime)s] p%(process)s {%(filename)s:%(lineno)d} %(levelname)s - %(message)s', level=logging.INFO)
-# logger = logging.getLogger(__name__)
 
 
 class AgentsForAmazonBedrock:
@@ -298,7 +295,6 @@ class AgentsForAmazonBedrock:
         _latest_update = datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=tzutc())
 
         for _summary in _agent_aliases["agentAliasSummaries"]:
-            # print(_summary)
             _curr_update = _summary["updatedAt"]
             if _curr_update > _latest_update:
                 _latest_alias_id = _summary["agentAliasId"]
@@ -307,14 +303,11 @@ class AgentsForAmazonBedrock:
                 )
                 _latest_update = _curr_update
                 _alias_name = _summary["agentAliasName"]
-                # skip routing config since issue w/ version being blank
-                # print(f"agent id: {agent_id}, routing config: {_summary['routingConfiguration']}")
-                # _alias_version = _summary['routingConfiguration'][0]['agentVersion']
 
         if verbose:
             print(f"for id: {agent_id}, picked latest alias: {_latest_alias_id}")
             print(f"  updated at: {_latest_update}")
-            print(f"  alias name: {_alias_name}\n")  # , version: {_alias_version}\n")
+            print(f"  alias name: {_alias_name}\n")
 
         return _latest_alias_id
 
@@ -469,13 +462,15 @@ class AgentsForAmazonBedrock:
         z.write(f"{source_code_file}")
         z.close()
         zip_content = s.getvalue()
-        # TODO: make this an optional keyword arg. only supply it when sub-agent-arns are provided or DynamoDB variables are provided
+
+        # If sub_agent_arns or dynamo_args are set, we might add environment variables
         if sub_agent_arns:
             env_variables = {
                 "Variables": {"SUB_AGENT_IDS": self._make_agent_string(sub_agent_arns)}
             }
         else:
             env_variables = {"Variables": {}}
+
         if dynamo_args:
             # add DynamoDB Table permissions to the Lambda Function
             lambda_role = self._create_lambda_iam_role(
@@ -554,9 +549,7 @@ class AgentsForAmazonBedrock:
             (agent for agent in _agents_json if agent["agentName"] == agent_name), None
         )
         if _target_agent is not None:
-            # pprint.pp(_target_agent)
             _agent_id = _target_agent["agentId"]
-
             _get_agent_resp = self._bedrock_agent_client.get_agent(agentId=_agent_id)
             return _get_agent_resp["agent"]["agentResourceRoleArn"]
         else:
@@ -620,9 +613,6 @@ class AgentsForAmazonBedrock:
             self._bedrock_agent_client.delete_agent(agentId=_agent_id)
             time.sleep(5)
 
-        # TODO: add delete_lambda_flag parameter to optionall take care of
-        # deleting the lambda function associated with the agent.
-
         # delete Agent IAM role if desired
         if delete_role_flag:
             _agent_role_name = f"AmazonBedrockExecutionRoleForAgents_{agent_name}"
@@ -633,26 +623,26 @@ class AgentsForAmazonBedrock:
                 self._iam_client.delete_role_policy(
                     PolicyName="bedrock_gr_allow_policy", RoleName=_agent_role_name
                 )
-            except Exception as e:
+            except Exception:
                 pass
 
             try:
                 self._iam_client.delete_role_policy(
                     PolicyName="bedrock_allow_policy", RoleName=_agent_role_name
                 )
-            except Exception as e:
+            except Exception:
                 pass
 
             try:
                 self._iam_client.delete_role_policy(
                     PolicyName="bedrock_kb_allow_policy", RoleName=_agent_role_name
                 )
-            except Exception as e:
+            except Exception:
                 pass
 
             try:
                 self._iam_client.delete_role(RoleName=_agent_role_name)
-            except Exception as e:
+            except Exception:
                 pass
 
         return
@@ -684,7 +674,6 @@ class AgentsForAmazonBedrock:
 
             # try creating the default role, which may already exist
             try:
-                # create the default role w/ the proper assume role policy
                 _assume_role_policy_document_json = DEFAULT_AGENT_IAM_ASSUME_ROLE_POLICY
                 _assume_role_policy_document = json.dumps(
                     _assume_role_policy_document_json
@@ -718,9 +707,6 @@ class AgentsForAmazonBedrock:
 
         else:
             _agent_role_name = f"AmazonBedrockExecutionRoleForAgents_{agent_name}"
-            # _tmp_resources = [f"arn:aws:bedrock:{self._region}::foundation-model/{_model}" for _model in agent_foundation_models]
-
-            # Create IAM policies for agent
             _assume_role_policy_document = DEFAULT_AGENT_IAM_ASSUME_ROLE_POLICY
             _assume_role_policy_document_json = json.dumps(_assume_role_policy_document)
 
@@ -736,14 +722,16 @@ class AgentsForAmazonBedrock:
                 print(
                     f"Role {_agent_role_name} created. ARN: {_agent_role['Role']['Arn']}"
                 )
-                print(
-                    f"Adding bedrock_allow_policy to role {_agent_role_name}\n{_bedrock_policy_json}..."
-                )
 
             _bedrock_agent_bedrock_allow_policy_statement = DEFAULT_AGENT_IAM_POLICY
             _bedrock_policy_json = json.dumps(
                 _bedrock_agent_bedrock_allow_policy_statement
             )
+
+            if verbose:
+                print(
+                    f"Adding bedrock_allow_policy to role {_agent_role_name}\n{_bedrock_policy_json}..."
+                )
 
             self._iam_client.put_role_policy(
                 PolicyDocument=_bedrock_policy_json,
@@ -776,28 +764,6 @@ class AgentsForAmazonBedrock:
 
                 # Pause to make sure role is updated
                 time.sleep(10)
-
-            # TODO: scope down GR access to a single GR passed as param
-            # # Support Guardrail access
-            # _gr_policy_doc = {
-            #     "Version": "2012-10-17",
-            #     "Statement": [{
-            #         "Sid": "AmazonBedrockAgentBedrockInvokeGuardrailModelPolicy",
-            #             "Effect": "Allow",
-            #             "Action": [
-            #                 "bedrock:InvokeModel",
-            #                 "bedrock:GetGuardrail",
-            #                 "bedrock:ApplyGuardrail"
-            #             ],
-            #             "Resource": f"arn:aws:bedrock:*:{self._account_id}:guardrail/*"
-            #         }]
-            # }
-            # _gr_policy_json = json.dumps(_gr_policy_doc)
-            # self._iam_client.put_role_policy(
-            #     PolicyDocument=_gr_policy_json,
-            #     PolicyName="bedrock_gr_allow_policy",
-            #     RoleName=_agent_role_name
-            # )
 
             return _agent_role["Role"]["Arn"]
 
@@ -842,9 +808,7 @@ class AgentsForAmazonBedrock:
 
     def associate_sub_agents(self, supervisor_agent_id, sub_agents_list):
         for sub_agent in sub_agents_list:
-            self.wait_agent_status_update(
-                supervisor_agent_id
-            )  # Be sure agent is not still in CREATING state
+            self.wait_agent_status_update(supervisor_agent_id)
             association_response = (
                 self._bedrock_agent_client.associate_agent_collaborator(
                     agentId=supervisor_agent_id,
@@ -852,7 +816,7 @@ class AgentsForAmazonBedrock:
                     agentDescriptor={"aliasArn": sub_agent["sub_agent_alias_arn"]},
                     collaboratorName=sub_agent["sub_agent_association_name"],
                     collaborationInstruction=sub_agent["sub_agent_instruction"],
-                    relayConversationHistory=sub_agent["relay_conversation_history"],
+                    relay_conversation_history=sub_agent["relay_conversation_history"],
                 )
             )
             self.wait_agent_status_update(supervisor_agent_id)
@@ -882,7 +846,7 @@ class AgentsForAmazonBedrock:
                     "sub_agent_alias_arn": _agent_details["agentArn"],
                     "sub_agent_instruction": _agent_details["instruction"],
                     "sub_agent_association_name": _agent_details["agentName"],
-                    "relay_conversation_history": "DISABLED",  #'TO_COLLABORATOR'
+                    "relay_conversation_history": "DISABLED",
                 }
             )
 
@@ -913,12 +877,14 @@ class AgentsForAmazonBedrock:
             model_ids (List[str]): IDs of the foundation models this agent is allowed to use, the first one will be used
             to create the agent, and the others will also be captured in the agent IAM role for future use
             kb_arns (List[str], Optional): ARNs of the Knowledge Base(s) this agent is allowed to use
-            agent_collaboration (str, Optional): collaboration type for the agent, defaults to 'SUPERVISOR_ROUTER'
-            code_interpretation (bool, Optional): whether to enable code interpretation for the agent, defaults to False
-            verbose (bool, Optional): whether to print verbose output, defaults to False
+            agent_collaboration (str, Optional): collaboration type for the agent
+            code_interpretation (bool, Optional): whether to enable code interpretation for the agent
+            guardrail_id (str, optional): ID of a guardrail to associate
+            kb_id (str, optional): ID of a knowledge base for agent association
+            verbose (bool, optional): Whether to print debug info
 
         Returns:
-            str: agent ID
+            (str, str, str): agent_id, agent_alias_id, agent_alias_arn
         """
         if verbose:
             print(f"Creating agent: {agent_name}...")
@@ -938,7 +904,6 @@ class AgentsForAmazonBedrock:
         _agent_id = None
 
         _kwargs = {}
-
         if routing_classifier_model is not None:
             _kwargs["promptOverrideConfiguration"] = {
                 "promptConfigurations": [
@@ -964,9 +929,7 @@ class AgentsForAmazonBedrock:
                 _create_agent_response = self._bedrock_agent_client.create_agent(
                     agentName=agent_name,
                     agentResourceRoleArn=_role_arn,
-                    description=agent_description.replace(
-                        "\n", ""
-                    ),  # console doesn't like newlines for subsequent editing
+                    description=agent_description.replace("\n", ""),
                     idleSessionTTLInSeconds=1800,
                     foundationModel=_model_id,
                     instruction=agent_instructions,
@@ -995,7 +958,6 @@ class AgentsForAmazonBedrock:
                     raise e
 
         if code_interpretation:
-            # possible time.sleep(15) needed here
             self.add_code_interpreter(agent_name)
 
         _agent_alias_id = DEFAULT_ALIAS
@@ -1011,9 +973,8 @@ class AgentsForAmazonBedrock:
         _agent_id = self.get_agent_id_by_name(agent_name)
         if _agent_id is None:
             return "Agent not found"
-
         _resp = self._bedrock_agent_client.prepare_agent(agentId=_agent_id)
-        time.sleep(5)  # make sure agent is ready to be invoked as soon as we return
+        time.sleep(5)
         return
 
     def create_agent_alias(self, agent_id: str, alias_name: str) -> Tuple[str, str]:
@@ -1051,10 +1012,9 @@ class AgentsForAmazonBedrock:
             parentActionGroupSignature="AMAZON.CodeInterpreter",
             actionGroupState="ENABLED",
         )
-        # check the response and if successful, prepare the agent
         if _agent_action_group_resp["ResponseMetadata"]["HTTPStatusCode"] == 200:
             _resp = self._bedrock_agent_client.prepare_agent(agentId=_agent_id)
-            time.sleep(5)  # make sure agent is ready to be invoked as soon as we return
+            time.sleep(5)
         else:
             print(f"Error adding code interpreter to agent: {_agent_action_group_resp}")
         return
@@ -1080,13 +1040,13 @@ class AgentsForAmazonBedrock:
             agent_name (str): name of the existing agent
             lambda_function_name (str): name of the Lambda function to create
             source_code_file (str): path to the source code file for the new Lambda function
-            agent_functions (List[Dict]): list of agent function descriptions to implement in the action group
+            agent_functions (List[Dict]): list of agent function descriptions
             agent_action_group_name (str): name of the agent action group
             agent_action_group_description (str): description of the agent action group
-            additional_function_iam_policy (Dict, Optional): additional IAM policy to attach to the Lambda function
-            sub_agent_arns (List[str], Optional): list of ARNs of sub-agents (if any) to permit the Lambda to invoke
+            additional_function_iam_policy (Dict, optional): additional IAM policy for the lambda
+            sub_agent_arns (List[str], optional): sub-agents for the lambda
+            dynamo_args (List[str], optional): optional arguments for creating & accessing a DynamoDB table
         """
-
         _agent_id = self.get_agent_id_by_name(agent_name)
         if _agent_id is None:
             return "Agent not found"
@@ -1127,16 +1087,15 @@ class AgentsForAmazonBedrock:
         agent_action_group_name: str,
         agent_action_group_description: str = None,
     ) -> None:
-        """Adds a return of control (ROD) action group to an existing agent,
+        """Adds a return of control (ROC) action group to an existing agent,
         and prepares the agent so it is ready to be invoked.
 
         Args:
             agent_id (str): ID of the existing agent
-            agent_functions (List[Dict]): list of agent function descriptions to implement in the action group
+            agent_functions (List[Dict]): list of agent function descriptions
             agent_action_group_name (str): name of the agent action group
             agent_action_group_description (str, Optional): description of the agent action group
         """
-
         _agent_action_group_resp = self._bedrock_agent_client.create_agent_action_group(
             agentId=agent_id,
             agentVersion="DRAFT",
@@ -1146,7 +1105,7 @@ class AgentsForAmazonBedrock:
             description=agent_action_group_description,
         )
         _resp = self._bedrock_agent_client.prepare_agent(agentId=agent_id)
-        time.sleep(5)  # make sure agent is ready to be invoked as soon as we return
+        time.sleep(5)
         return
 
     def get_function_defs(self, agent_name: str) -> List[dict]:
@@ -1158,15 +1117,12 @@ class AgentsForAmazonBedrock:
         Returns:
             List[dict]: A list of function definitions.
         """
-        # "sub-agents-ag"
         _agent_id = self.get_agent_id_by_name(agent_name)
         if _agent_id is None:
             raise ValueError(f"Agent {agent_name} not found")
         _list_resp = self._bedrock_agent_client.list_agent_action_groups(
             agentId=_agent_id, agentVersion="DRAFT"
         )
-        # TODO: don't assume there's only a single action group, and
-        # handle case where no action groups exist
         _action_group_id = _list_resp["actionGroupSummaries"][0]["actionGroupId"]
         _get_ag_resp = self._bedrock_agent_client.get_agent_action_group(
             agentId=_agent_id, actionGroupId=_action_group_id, agentVersion="DRAFT"
@@ -1181,21 +1137,17 @@ class AgentsForAmazonBedrock:
         kb_arn: str = None,
         kb_descr: str = None,
     ) -> tuple[List[dict], str]:
-        """Creates a supervisor agent that takes in user input and delegates the work to one of its
-        available sub-agents. For each sub-agent, the supervisor agent has a distinct action in its action group.
-        A supervisor Lambda function implements the pass-through logic to invoke the chosen sub-agent.
+        """Creates a supervisor agent that delegates tasks to sub-agents.
 
         Args:
-            supervisor_agent_name (str): The name of the new supervisor agent.
-            sub_agent_names (List[str]): A list of named sub-agents that this supervisor agent uses to get its work done.
-            model_ids (List[str]): IDs of the foundation models this supervisor agent is allowed to use,
-            the first one will be used to create the agent, and the others will also be captured in the
-            agent IAM role for future use in case you update the agent to switch LLMs.
-            kb_arn (str, Optional): ARN of the Knowledge Base this supervisor agent is allowed to use.
-            kb_descr (str, Optional): Description of the Knowledge Base this supervisor agent is allowed to use.
+            supervisor_agent_name (str): name of the new supervisor agent
+            sub_agent_names (List[str]): list of named sub-agents
+            model_ids (List[str]): foundation models
+            kb_arn (str, optional): knowledge base ARN
+            kb_descr (str, optional): knowledge base description
 
         Returns:
-            tuple[List[dict], str]: A tuple containing a list of function definitions and the ARN of the new agent.
+            tuple[List[dict], str]: function definitions and the new agent ARN
         """
 
         supervisor_description = """You are a Supervisor Agent that plans and executes multi step tasks based on user input.
@@ -1227,9 +1179,6 @@ class AgentsForAmazonBedrock:
                 _instruction = _agent_details["instruction"]
             else:
                 _instruction = ""
-
-            # create function definition for each sub agent, allowing the supervisor agent
-            # to know what expert agents it has available.
 
             _function_defs.append(
                 {
@@ -1269,9 +1218,7 @@ class AgentsForAmazonBedrock:
         _response = self._bedrock_agent_client.create_agent(
             agentName=supervisor_agent_name,
             agentResourceRoleArn=_supervisor_role_arn,
-            description=supervisor_description.replace(
-                "\n", ""
-            ),  # console doesn't like newlines for subsequent editing
+            description=supervisor_description.replace("\n", ""),
             idleSessionTTLInSeconds=1800,
             foundationModel=model_ids[0],
             promptOverrideConfiguration={
@@ -1296,7 +1243,7 @@ class AgentsForAmazonBedrock:
             _kb_id = kb_arn.split("/")[-1]
             self.associate_kb_with_agent(_supervisor_agent_id, kb_descr, _kb_id)
 
-        # Add an action group to the supervisor agent, with a single action that invokes the selected sub-agent
+        # Add an action group
         self.add_action_group_with_lambda(
             supervisor_agent_name,
             f"{supervisor_agent_name}_lambda",
@@ -1313,15 +1260,9 @@ class AgentsForAmazonBedrock:
         self, orig_agent_answer, event, enable_trace=False, trace_level="none"
     ):
         _citations = event.get("chunk", {}).get("attribution", {}).get("citations", [])
-        if _citations:
-            if enable_trace:
-                print(
-                    f"got {len(event['chunk']['attribution']['citations'])} citations \n"
-                )
-        else:
+        if not _citations:
             return orig_agent_answer
 
-        # remove <sources> tags to work around a bug
         _pattern = r"\n\n<sources>\n\d+\n</sources>\n\n"
         _cleaned_text = re.sub(_pattern, "", orig_agent_answer)
         _pattern = "<sources><REDACTED></sources>"
@@ -1338,18 +1279,17 @@ class AgentsForAmazonBedrock:
 
             _start = _citation["generatedResponsePart"]["textResponsePart"]["span"][
                 "start"
-            ] - (
-                _curr_citation_idx + 1
-            )  # +1
+            ] - (_curr_citation_idx + 1)
             _end = (
                 _citation["generatedResponsePart"]["textResponsePart"]["span"]["end"]
                 - (_curr_citation_idx + 2)
                 + 4
-            )  # +2
+            )
+
             _refs = _citation.get("retrievedReferences", [])
             if len(_refs) > 0:
-                _ref_url = (
-                    _refs[0].get("location", {}).get("s3Location", {}).get("uri", "")
+                _ref_url = _refs[0].get("location", {}).get("s3Location", {}).get(
+                    "uri", ""
                 )
             else:
                 _ref_url = ""
@@ -1405,11 +1345,17 @@ class AgentsForAmazonBedrock:
             session_state (dict, optional): The state of the session. Defaults to an empty dict.
             enable_trace (bool, optional): Whether to enable trace. Defaults to False.
             end_session (bool, optional): Whether to end the session. Defaults to False.
-            trace_level (str, optional): The level of trace. Defaults to "none". Possible values are "none", "all", "core".
+            trace_level (str, optional): The level of trace. Defaults to "none". 
+                                         Possible values: "none", "all", "core".
+            multi_agent_names (dict, optional): For multi-agent usage, pass alias_id->agent_name mapping
 
         Returns:
-            str: The answer from the agent.
+            str: The final answer from the agent.
         """
+        # Print all the input parameters of this function
+        print(
+            f"invokeAgent API input parameters: input_text: {input_text}, agent_id: {agent_id}, agent_alias_id: {agent_alias_id}, session_id: {session_id}, session_state: {session_state}, enable_trace: {enable_trace}, end_session: {end_session}, trace_level: {trace_level}, multi_agent_names: {multi_agent_names}"
+        )
 
         _time_before_call = datetime.datetime.now()
 
@@ -1422,6 +1368,33 @@ class AgentsForAmazonBedrock:
             enableTrace=enable_trace,
             endSession=end_session,
         )
+
+        ####################################################################
+        # --------- New Code to Dump the Agent Trace as JSON File --------- #
+        ####################################################################
+        # When trace is enabled and trace_level is 'all', dump the entire
+        # raw response (including event stream) to a JSON file named "trace.json".
+        if enable_trace and trace_level == "all":
+            agent_resp_for_json = copy.deepcopy(_agent_resp)
+            # Convert any binary fields (like 'chunk'->'bytes' or 'files'->'bytes') to base64
+            if "completion" in agent_resp_for_json:
+                for event_obj in agent_resp_for_json["completion"]:
+                    if "chunk" in event_obj and "bytes" in event_obj["chunk"]:
+                        event_obj["chunk"]["bytes"] = base64.b64encode(
+                            event_obj["chunk"]["bytes"]
+                        ).decode("utf-8")
+                    if "files" in event_obj:
+                        for file_obj in event_obj["files"].get("files", []):
+                            if "bytes" in file_obj:
+                                file_obj["bytes"] = base64.b64encode(
+                                    file_obj["bytes"]
+                                ).decode("utf-8")
+
+            with open("trace.json", "w", encoding="utf-8") as f:
+                json.dump(agent_resp_for_json, f, indent=2)
+            ####################################################################
+            # --------------------- End of New JSON Dump ---------------------- #
+            ####################################################################
 
         if enable_trace:
             if trace_level == "all":
@@ -1471,17 +1444,13 @@ class AgentsForAmazonBedrock:
                                 _sub_agent_alias_arn = _event["trace"]["callerChain"][
                                     1
                                 ]["agentAliasArn"]
-                                # get sub agent id by grabbing all text following the first '/' character
-                                _sub_agent_alias_id = _sub_agent_alias_arn.split(
-                                    "/", 1
-                                )[1]
-                                _sub_agent_name = multi_agent_names[_sub_agent_alias_id]
-                                # _sub_agent_name = "<not-yet-provided>"
-
-                        # if 'collaboratorName' in _event['trace']:
-                        #     _sub_agent_name = _event['trace']['collaboratorName']
-                        # else:
-                        #     _sub_agent_name = "<collab-name-not-yet-provided>"
+                                _sub_agent_alias_id = _sub_agent_alias_arn.split("/", 1)[
+                                    1
+                                ]
+                                _sub_agent_name = multi_agent_names.get(
+                                    _sub_agent_alias_id,
+                                    "<collab-name-not-yet-provided>",
+                                )
 
                     if "routingClassifierTrace" in _event["trace"]["trace"]:
                         _route = _event["trace"]["trace"]["routingClassifierTrace"]
@@ -1525,20 +1494,17 @@ class AgentsForAmazonBedrock:
                             if _classification == UNDECIDABLE_CLASSIFICATION:
                                 print(
                                     colored(
-                                        f"Routing classifier did not find a matching collaborator. Reverting to 'SUPERVISOR' mode.",
+                                        "Routing classifier did not find a matching collaborator. Reverting to 'SUPERVISOR' mode.",
                                         "magenta",
                                     )
                                 )
                             elif _classification == "keep_previous_agent":
                                 print(
                                     colored(
-                                        f"Continuing conversation with previous collaborator.",
+                                        "Continuing conversation with previous collaborator.",
                                         "magenta",
                                     )
                                 )
-                                # # since we replaced the typical orchestration step with a simple routing
-                                # # classification, bump the step count.
-                                # _orch_step += 1
                             else:
                                 _sub_agent_name = _classification
                                 print(
@@ -1547,9 +1513,6 @@ class AgentsForAmazonBedrock:
                                         "magenta",
                                     )
                                 )
-                                # # since we replaced the typical orchestration step with a simple routing
-                                # # classification, bump the step count.
-                                # _orch_step += 1
                             print(
                                 colored(
                                     f"Routing classifier took {_route_duration.total_seconds():,.1f}s, using {_in_tokens+_out_tokens} tokens (in: {_in_tokens}, out: {_out_tokens}).\n",
@@ -1574,10 +1537,7 @@ class AgentsForAmazonBedrock:
                                 print(colored(f"{_rationale['text']}", "blue"))
 
                             if "invocationInput" in _orch:
-                                # NOTE: when agent determines invocations should happen in parallel
-                                # the trace objects for invocation input still come back one at a time.
                                 _input = _orch["invocationInput"]
-
                                 if "actionGroupInvocationInput" in _input:
                                     if trace_level == "outline":
                                         print(
@@ -1587,60 +1547,41 @@ class AgentsForAmazonBedrock:
                                             )
                                         )
                                     else:
-                                        if (
-                                            "function"
-                                            not in _input["actionGroupInvocationInput"]
-                                        ):
-                                            print(
-                                                colored(
-                                                    f"EXPECTING to capture 'Using tool', but 'function' not found\n{_input['actionGroupInvocationInput']}",
-                                                    "red",
-                                                )
+                                        print(
+                                            colored(
+                                                f"Using tool: {_input['actionGroupInvocationInput']['function']} with these inputs:",
+                                                "magenta",
                                             )
-                                        else:
-                                            print(
-                                                colored(
-                                                    f"Using tool: {_input['actionGroupInvocationInput']['function']} with these inputs:",
-                                                    "magenta",
-                                                )
-                                            )
-                                            if (
+                                        )
+                                        if "parameters" in _input[
+                                            "actionGroupInvocationInput"
+                                        ]:
+                                            params = _input["actionGroupInvocationInput"][
                                                 "parameters"
-                                                in _input["actionGroupInvocationInput"]
+                                            ]
+                                            if (
+                                                len(params) == 1
+                                                and params[0]["name"] == "input_text"
                                             ):
-                                                if (
-                                                    len(
-                                                        _input[
-                                                            "actionGroupInvocationInput"
-                                                        ]["parameters"]
-                                                    )
-                                                    == 1
-                                                ) and (
-                                                    _input[
-                                                        "actionGroupInvocationInput"
-                                                    ]["parameters"][0]["name"]
-                                                    == "input_text"
-                                                ):
-                                                    print(
-                                                        colored(
-                                                            f"{_input['actionGroupInvocationInput']['parameters'][0]['value']}",
-                                                            "magenta",
-                                                        )
-                                                    )
-                                                else:
-                                                    print(
-                                                        colored(
-                                                            f"{_input['actionGroupInvocationInput']['parameters']}\n",
-                                                            "magenta",
-                                                        )
-                                                    )
-                                            else:
                                                 print(
                                                     colored(
-                                                        f"    no input parameters being sent\n",
+                                                        f"{params[0]['value']}",
                                                         "magenta",
                                                     )
                                                 )
+                                            else:
+                                                print(
+                                                    colored(
+                                                        f"{params}\n", "magenta"
+                                                    )
+                                                )
+                                        else:
+                                            print(
+                                                colored(
+                                                    "    no input parameters being sent\n",
+                                                    "magenta",
+                                                )
+                                            )
 
                                 elif "agentCollaboratorInvocationInput" in _input:
                                     _collab_name = _input[
@@ -1679,9 +1620,7 @@ class AgentsForAmazonBedrock:
                                 elif "codeInterpreterInvocationInput" in _input:
                                     if trace_level == "outline":
                                         print(
-                                            colored(
-                                                f"Using code interpreter", "magenta"
-                                            )
+                                            colored("Using code interpreter", "magenta")
                                         )
                                     else:
                                         console = Console()
@@ -1689,7 +1628,6 @@ class AgentsForAmazonBedrock:
                                             "codeInterpreterInvocationInput"
                                         ]["code"]
                                         _code = f"```python\n{_gen_code}\n```"
-
                                         console.print(
                                             Markdown(f"**Generated code**\n{_code}")
                                         )
@@ -1697,7 +1635,7 @@ class AgentsForAmazonBedrock:
                                 elif "knowledgeBaseLookupInput" in _input:
                                     if trace_level == "outline":
                                         print(
-                                            colored(f"Using knowledge base", "magenta")
+                                            colored("Using knowledge base", "magenta")
                                         )
                                     else:
                                         _kb_id = _input["knowledgeBaseLookupInput"][
@@ -1715,9 +1653,9 @@ class AgentsForAmazonBedrock:
                                         print(colored(f"  {_kb_query}\n", "magenta"))
 
                             if "observation" in _orch:
-                                if trace_level == "core":
-                                    _output = _orch["observation"]
-                                    if "actionGroupInvocationOutput" in _output:
+                                _output = _orch["observation"]
+                                if "actionGroupInvocationOutput" in _output:
+                                    if trace_level == "core":
                                         print(
                                             colored(
                                                 f"--tool outputs:\n{_output['actionGroupInvocationOutput']['text'][0:TRACE_TRUNCATION_LENGTH]}...\n",
@@ -1725,13 +1663,14 @@ class AgentsForAmazonBedrock:
                                             )
                                         )
 
-                                    if "agentCollaboratorInvocationOutput" in _output:
-                                        _collab_name = _output[
-                                            "agentCollaboratorInvocationOutput"
-                                        ]["agentCollaboratorName"]
-                                        _collab_output_text = _output[
-                                            "agentCollaboratorInvocationOutput"
-                                        ]["output"]["text"][0:TRACE_TRUNCATION_LENGTH]
+                                if "agentCollaboratorInvocationOutput" in _output:
+                                    _collab_name = _output[
+                                        "agentCollaboratorInvocationOutput"
+                                    ]["agentCollaboratorName"]
+                                    _collab_output_text = _output[
+                                        "agentCollaboratorInvocationOutput"
+                                    ]["output"]["text"][0:TRACE_TRUNCATION_LENGTH]
+                                    if trace_level == "core":
                                         print(
                                             colored(
                                                 f"\n----sub-agent {_collab_name} output text:\n{_collab_output_text}...\n",
@@ -1739,11 +1678,12 @@ class AgentsForAmazonBedrock:
                                             )
                                         )
 
-                                    if "knowledgeBaseLookupOutput" in _output:
-                                        _refs = _output["knowledgeBaseLookupOutput"][
-                                            "retrievedReferences"
-                                        ]
-                                        _ref_count = len(_refs)
+                                if "knowledgeBaseLookupOutput" in _output:
+                                    _refs = _output["knowledgeBaseLookupOutput"][
+                                        "retrievedReferences"
+                                    ]
+                                    _ref_count = len(_refs)
+                                    if trace_level == "core":
                                         print(
                                             colored(
                                                 f"Knowledge base lookup output, {_ref_count} references:\n",
@@ -1760,22 +1700,14 @@ class AgentsForAmazonBedrock:
                                             )
                                             _curr += 1
 
-                                    if "finalResponse" in _output:
+                                if "finalResponse" in _output:
+                                    if trace_level == "core":
                                         print(
                                             colored(
                                                 f"Final response:\n{_output['finalResponse']['text'][0:TRACE_TRUNCATION_LENGTH]}...",
                                                 "cyan",
                                             )
                                         )
-
-                        # if 'modelInvocationInput' in _orch:
-                        #     if _sub_agent_alias_id is not None:
-                        #         _sub_step += 1
-                        #         print(colored(f"---- Step {_orch_step}.{_sub_step} [using sub-agent name:{_sub_agent_name}, id:{_sub_agent_alias_id}] ----", "green"))
-                        #     else:
-                        #         _orch_step += 1
-                        #         _sub_step = 0
-                        #         print(colored(f"---- Step {_orch_step} ----", "green"))
 
                         if "modelInvocationOutput" in _orch:
                             if _sub_agent_alias_id is not None:
@@ -1812,7 +1744,6 @@ class AgentsForAmazonBedrock:
                                 )
                             )
 
-                            # restart the clock for next step/sub-step
                             _time_before_orchestration = datetime.datetime.now()
 
                     elif "preProcessingTrace" in _event["trace"]["trace"]:
@@ -1828,7 +1759,6 @@ class AgentsForAmazonBedrock:
                             _total_out_tokens += _out_tokens
 
                             _total_llm_calls += 1
-
                             print(
                                 colored(
                                     "Pre-processing trace, agent came up with an initial plan.",
@@ -1870,24 +1800,20 @@ class AgentsForAmazonBedrock:
                     console = Console()
                     files_event = _event["files"]
                     console.print(Markdown("**Files**"))
-
                     files_list = files_event["files"]
                     for this_file in files_list:
                         print(f"{this_file['name']} ({this_file['type']})")
                         file_bytes = this_file["bytes"]
 
-                        # save bytes to file, given the name of file and the bytes
+                        # Save bytes to a local file
                         file_name = os.path.join("output", this_file["name"])
                         with open(file_name, "wb") as f:
                             f.write(file_bytes)
-                        # if this_file['type'] == 'image/png' or this_file['type'] == 'image/jpeg':
-                        #     img = mpimg.imread(file_name)
-                        #     # plt.imshow(img)
-                        #     # plt.show()
+                        # If you want to display images in a notebook or a local environment,
+                        # you can load them from the saved file.
 
             if enable_trace:
                 duration = datetime.datetime.now() - _time_before_call
-
                 if trace_level in ["core", "outline"]:
                     print(
                         colored(
@@ -1898,7 +1824,6 @@ class AgentsForAmazonBedrock:
                             "yellow",
                         )
                     )
-
                 if trace_level == "all":
                     print(f"Returning agent answer as: {_agent_answer}")
 
@@ -1925,8 +1850,8 @@ class AgentsForAmazonBedrock:
         enable_trace: bool = False,
         end_session: bool = False,
     ):
-        """Performs an invoke_agent() call for an agent with an ROC action group. Also used
-        for subsequent processing of the function call result from a prior ROC agent call.
+        """Performs an invoke_agent() call for an agent with an ROC action group. 
+        Also used for returning control to the agent after a function call result.
 
         Args:
             input_text (str): The text to be processed by the agent.
@@ -1934,7 +1859,7 @@ class AgentsForAmazonBedrock:
             agent_alias_id (str, optional): The alias ID of the agent to invoke. Defaults to DEFAULT_ALIAS.
             session_id (str, optional): The ID of the session. Defaults to a new UUID.
             function_call (str, optional): The function call that was made previously. Defaults to None.
-            function_call_result (str, optional): The result of the function call that was made previously. Defaults to None.
+            function_call_result (str, optional): The result of the function call. Defaults to None.
             enable_trace (bool, optional): Whether to enable trace. Defaults to False.
             end_session (bool, optional): Whether to end the session. Defaults to False.
 
@@ -1978,8 +1903,6 @@ class AgentsForAmazonBedrock:
                 endSession=end_session,
             )
 
-        # logger.info(pprint.pprint(agentResponse))
-
         _agent_answer = ""
         _event_stream = _agent_resp["completion"]
         try:
@@ -1987,8 +1910,6 @@ class AgentsForAmazonBedrock:
                 if "chunk" in _event:
                     _data = _event["chunk"]["bytes"]
                     _agent_answer = _data.decode("utf8")
-                    _end_event_received = True
-                    # End event indicates that the request finished successfully
                 elif "returnControl" in _event:
                     _agent_answer = _event["returnControl"]
                 elif "trace" in _event:
@@ -2021,26 +1942,23 @@ class AgentsForAmazonBedrock:
 
         # Get current agent details
         _get_agent_response = self._bedrock_agent_client.get_agent(agentId=_agent_id)
-
         _agent_details = _get_agent_response.get("agent")
 
-        # Update model id.
+        # Update model id
         if new_model_id is not None:
             _agent_details["foundationModel"] = new_model_id
 
-        # Update instructions.
+        # Update instructions
         if new_instructions is not None:
             _agent_details["instruction"] = new_instructions
 
-        # Update guardrail or if there was none, this will add it.
+        # Update guardrail or remove it
         if guardrail_id is not None:
             _agent_details["guardrailConfiguration"] = {
                 "guardrailIdentifier": guardrail_id,
                 "guardrailVersion": "DRAFT",
             }
         else:
-            # if the guardrail configuration is present, remove it from agent details since
-            # the caller wants to remove the association
             if "guardrailConfiguration" in _agent_details:
                 del _agent_details["guardrailConfiguration"]
 
@@ -2070,16 +1988,12 @@ class AgentsForAmazonBedrock:
             if key_to_remove in _agent_details:
                 del _agent_details[key_to_remove]
 
-        # Update the agent.
+        # Update the agent
         _update_agent_response = self._bedrock_agent_client.update_agent(
             **_agent_details
         )
-
         time.sleep(3)
-
-        # Prepare Agent
         self._bedrock_agent_client.prepare_agent(agentId=_agent_id)
-
         return _update_agent_response
 
     def create_dynamodb(self, table_name, pk_item, sk_item):
@@ -2094,19 +2008,14 @@ class AgentsForAmazonBedrock:
                     {"AttributeName": pk_item, "AttributeType": "S"},
                     {"AttributeName": sk_item, "AttributeType": "S"},
                 ],
-                BillingMode="PAY_PER_REQUEST",  # Use on-demand capacity mode
+                BillingMode="PAY_PER_REQUEST",
             )
-
-            # Wait for the table to be created
-            # print(f'Creating table {table_name}...')
             table.wait_until_exists()
-            # print(f'Table {table_name} created successfully!')
         except self._dynamodb_client.exceptions.ResourceInUseException:
             print(f"Table {table_name} already exists, skipping table creation step")
 
     def load_dynamodb(self, table_name: str, items: List):
         try:
-
             table = self._dynamodb_resource.Table(table_name)
             for item in items:
                 table.put_item(Item=item)
@@ -2122,17 +2031,43 @@ class AgentsForAmazonBedrock:
         sk_value: str = None,
     ):
         try:
-
             table = self._dynamodb_resource.Table(table_name)
-            # Create expression
             if sk_field:
                 key_expression = Key(pk_field).eq(pk_value) & Key(sk_field).begins_with(
                     sk_value
                 )
             else:
                 key_expression = Key(pk_field).eq(pk_value)
-
             query_data = table.query(KeyConditionExpression=key_expression)
             return query_data["Items"]
         except self._dynamodb_client.exceptions.ResourceInUseException:
             print(f"Error querying table: {table_name}.")
+
+    def get_agent_by_name(self, agent_name: str) -> dict:
+        """Gets an agent using its name.
+        
+        Args:
+            agent_name (str): Name of the agent
+            
+        Returns:
+            dict: Agent details or None if not found
+        """
+        agent_id = self.get_agent_id_by_name(agent_name)
+        if agent_id is None:
+            return None
+        return self._bedrock_agent_client.get_agent(agentId=agent_id)["agent"]
+    
+
+    def get_agent_by_id(self, agent_id: str) -> dict:
+        """Gets an agent using its ID.
+        
+        Args:
+            agent_id (str): ID of the agent
+            
+        Returns:
+            dict: Agent details or None if not found
+        """
+        try:
+            return self._bedrock_agent_client.get_agent(agentId=agent_id)["agent"]
+        except self._bedrock_agent_client.exceptions.ResourceNotFoundException:
+            return None
