@@ -70,6 +70,7 @@ DEFAULT_AGENT_IAM_POLICY = {
                 "arn:aws:bedrock:*::foundation-model/*",
                 "arn:aws:bedrock:*:*:inference-profile/*",
                 "arn:aws:bedrock:*:*:application-inference-profile/*",
+                "arn:aws:bedrock:*:*:imported-model/*",  # Added to invoke the DeepSeek imported model, but now I think about it, it may not be needed since the agent is not going to interact with the imported model directly 
             ],
         },
         {
